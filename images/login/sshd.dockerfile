@@ -18,6 +18,12 @@ RUN /bin/bash /usr/src/pam-soperator-jail/build_pam_soperator_jail.sh \
     /usr/src/pam-soperator-jail/pam_soperator_jail.c \
     /out
 
+COPY images/common/pam_exec_clean_env.c /usr/src/pam-exec-clean-env/
+COPY images/common/scripts/build_pam_exec_clean_env.sh /usr/src/pam-exec-clean-env/
+RUN /bin/bash /usr/src/pam-exec-clean-env/build_pam_exec_clean_env.sh \
+    /usr/src/pam-exec-clean-env/pam_exec_clean_env.c \
+    /out
+
 # https://github.com/nebius/ml-containers/pull/98
 FROM cr.eu-north1.nebius.cloud/ml-containers/slurm:${SLURM_VERSION}-20260819104842 AS login_sshd
 
@@ -113,16 +119,29 @@ RUN rm -rf /home
 RUN rm -rf /etc/update-motd.d
 
 # Install the native PAM module that places each SSH session in its own mount
-# namespace and pivots it into /mnt/jail.
+# namespace and pivots it into /mnt/jail, together with the helper that gives
+# pam_exec hooks a sanitised environment.
 COPY --from=login_pam_builder /out/ /
+
+# Stop PAM from importing the authenticating user's ~/.pam_environment, which
+# lives in their writable jail home and would otherwise reach the root-executed
+# session modules registered below.
+COPY images/common/scripts/disable_pam_user_readenv.sh /opt/bin/
+RUN chmod +x /opt/bin/disable_pam_user_readenv.sh && \
+    /opt/bin/disable_pam_user_readenv.sh /etc/pam.d && \
+    rm /opt/bin/disable_pam_user_readenv.sh
 
 # Install the per-user cgroup isolation PAM hook.
 # It is a no-op unless enabled via the SlurmCluster `login.userIsolation` field.
+# The hook runs as uid 0 before the jail pivot, so it goes through
+# pam_exec_clean_env: pam_exec would otherwise hand it the PAM environment,
+# where a single variable (LD_PRELOAD, BASH_ENV, PATH, ...) is root code
+# execution in this privileged container.
 # Keep pam_soperator_jail last: it pivots the per-session sshd process into the
 # jail, so any PAM session modules after it would also run inside the jail.
 COPY images/login/user_isolation_pam_hook.sh /opt/bin/slurm/
 RUN chmod +x /opt/bin/slurm/user_isolation_pam_hook.sh && \
-    echo "session optional pam_exec.so quiet log=/proc/1/fd/1 /opt/bin/slurm/user_isolation_pam_hook.sh" >> /etc/pam.d/sshd && \
+    echo "session optional pam_exec.so quiet log=/proc/1/fd/1 /opt/bin/slurm/pam_exec_clean_env /opt/bin/slurm/user_isolation_pam_hook.sh" >> /etc/pam.d/sshd && \
     echo "session required pam_soperator_jail.so /mnt/jail" >> /etc/pam.d/sshd
 
 # Expose the port used for accessing sshd

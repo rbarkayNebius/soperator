@@ -1,9 +1,17 @@
-#!/bin/bash
+#!/bin/bash -p
 # PAM session hook (pam_exec): places each SSH session into a per-user cgroup v2.
 # Configured via the SlurmCluster `login.userIsolation` field.
 # Must never block a login: every failure path exits 0.
+#
+# Runs as uid 0 from the per-connection sshd, so nothing in the environment may
+# steer what this hook loads or executes: pam_exec starts it through
+# pam_exec_clean_env, which forwards only the PAM_* items and a fixed PATH, and
+# `bash -p` (no BASH_ENV, no ENV, no inherited functions) plus the PATH below
+# keep that true even if the hook is ever invoked directly.
 
 set -u
+
+PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 CONF="/etc/soperator/user-isolation.conf"
 READY_SENTINEL="/run/soperator-user-isolation.ready"
