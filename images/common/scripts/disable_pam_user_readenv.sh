@@ -17,13 +17,18 @@ if [ ! -d "${pam_dir}" ]; then
     exit 1
 fi
 
-shopt -s nullglob
-for config in "${pam_dir}"/*; do
-    [ -f "${config}" ] || continue
-    sed -i -E 's/(^|[[:space:]])user_readenv=[^[:space:]]+/\1user_readenv=0/g' "${config}"
+# -L so that a symlinked service file is followed to the file that PAM actually
+# reads, and --follow-symlinks so that sed rewrites that file instead of
+# replacing the link with a regular one. The same file set is used for the
+# assertion below, so nothing can be rewritten but left unchecked, or reported
+# but never reached.
+mapfile -d '' configs < <(find -L "${pam_dir}" -type f -print0)
+for config in "${configs[@]}"; do
+    grep -qE 'user_readenv=[^[:space:]]+' "${config}" || continue
+    sed -i --follow-symlinks -E 's/(^|[[:space:]])user_readenv=[^[:space:]]+/\1user_readenv=0/g' "${config}"
 done
 
-enabled="$(grep -rhoE 'user_readenv=[^[:space:]]+' "${pam_dir}" | sort -u | grep -vFx 'user_readenv=0' || true)"
+enabled="$(grep -hoE 'user_readenv=[^[:space:]]+' "${configs[@]}" /dev/null | sort -u | grep -vFx 'user_readenv=0' || true)"
 if [ -n "${enabled}" ]; then
     echo "PAM user environment reading is still enabled in ${pam_dir}: ${enabled}" >&2
     exit 1

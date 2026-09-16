@@ -3,15 +3,18 @@
 # Configured via the SlurmCluster `login.userIsolation` field.
 # Must never block a login: every failure path exits 0.
 #
-# Runs as uid 0 from the per-connection sshd, so nothing in the environment may
-# steer what this hook loads or executes: pam_exec starts it through
-# pam_exec_clean_env, which forwards only the PAM_* items and a fixed PATH, and
-# `bash -p` (no BASH_ENV, no ENV, no inherited functions) plus the PATH below
-# keep that true even if the hook is ever invoked directly.
+# Runs as uid 0 from the per-connection sshd, before pam_soperator_jail pivots
+# into the jail, so nothing in the environment may steer what this hook loads or
+# executes. Registering it through pam_exec_clean_env is mandatory: that helper
+# is the only thing that keeps the PAM environment - which can carry variables
+# authored by the authenticating user - away from this process. `bash -p` (no
+# BASH_ENV, no ENV, no inherited functions) and the PATH below narrow what the
+# shell itself honours, but they cannot stop the dynamic loader from acting on
+# an inherited LD_PRELOAD or LD_AUDIT.
 
 set -u
 
-PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 CONF="/etc/soperator/user-isolation.conf"
 READY_SENTINEL="/run/soperator-user-isolation.ready"
@@ -39,7 +42,7 @@ cgroup_base="$(cat "${READY_SENTINEL}" 2>/dev/null)"
 user="${PAM_USER:-}"
 [ -n "${user}" ] || exit 0
 
-uid="$(id -u "${user}" 2>/dev/null)" || exit 0
+uid="$(id -u -- "${user}" 2>/dev/null)" || exit 0
 
 # Never limit root or system users.
 [ "${uid}" -ge 1000 ] || exit 0

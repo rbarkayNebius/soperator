@@ -22,8 +22,10 @@ gcc \
 chmod 0755 "${binary_dir}/pam_exec_clean_env"
 
 # A program interpreter would mean the dynamic loader runs first, which is
-# exactly what the static linking is there to avoid.
-if readelf --program-headers "${binary_dir}/pam_exec_clean_env" | grep -q 'INTERP'; then
+# exactly what the static linking is there to avoid. readelf runs outside the
+# `if` so that its own failure aborts the build instead of passing the check.
+program_headers="$(readelf --program-headers "${binary_dir}/pam_exec_clean_env")"
+if grep -q 'INTERP' <<<"${program_headers}"; then
     echo "pam_exec_clean_env is not statically linked" >&2
     exit 1
 fi

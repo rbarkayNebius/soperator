@@ -141,8 +141,10 @@ RUN chmod +x /opt/bin/disable_pam_user_readenv.sh && \
 # jail, so any PAM session modules after it would also run inside the jail.
 COPY images/login/user_isolation_pam_hook.sh /opt/bin/slurm/
 RUN chmod +x /opt/bin/slurm/user_isolation_pam_hook.sh && \
+    test -x /opt/bin/slurm/pam_exec_clean_env && \
     echo "session optional pam_exec.so quiet log=/proc/1/fd/1 /opt/bin/slurm/pam_exec_clean_env /opt/bin/slurm/user_isolation_pam_hook.sh" >> /etc/pam.d/sshd && \
-    echo "session required pam_soperator_jail.so /mnt/jail" >> /etc/pam.d/sshd
+    echo "session required pam_soperator_jail.so /mnt/jail" >> /etc/pam.d/sshd && \
+    grep -q '^session optional pam_exec\.so .* /opt/bin/slurm/pam_exec_clean_env /opt/bin/slurm/user_isolation_pam_hook\.sh$' /etc/pam.d/sshd
 
 # Expose the port used for accessing sshd
 EXPOSE 22

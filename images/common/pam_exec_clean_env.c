@@ -23,24 +23,27 @@
 #include <string.h>
 #include <unistd.h>
 
-#define CLEAN_PATH "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+static char clean_path[] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/* Items pam_exec exports for its child. PAM_AUTHTOK is deliberately absent: an
- * authentication token must not leak into a hook's environment. */
+/* Only the three items pam_exec always exports, because pam_exec appends an
+ * item solely when the application set it: a name the application leaves unset
+ * (PAM_RUSER, and PAM_TTY or PAM_RHOST depending on the flow) has no
+ * authoritative occurrence, so its only value would be the user-authored one.
+ * PAM_AUTHTOK is absent for a different reason: an authentication token must
+ * not leak into a hook's environment. */
 static const char *const forwarded_variables[] = {
     "PAM_TYPE",
     "PAM_USER",
     "PAM_SERVICE",
-    "PAM_RHOST",
-    "PAM_RUSER",
-    "PAM_TTY",
 };
 
 #define FORWARDED_VARIABLE_COUNT (sizeof(forwarded_variables) / sizeof(forwarded_variables[0]))
 
 /* pam_exec appends its own PAM_* items after the entries taken from
- * pam_getenvlist(), so keeping the last occurrence of a name discards a
- * user-authored duplicate that would otherwise shadow the authoritative value.
+ * pam_getenvlist(), so for an item the application set, keeping the last
+ * occurrence of the name discards a user-authored duplicate that would
+ * otherwise shadow the authoritative value - glibc's getenv() returns the first
+ * one instead, which is why the child must not be left to look them up itself.
  */
 static char *last_occurrence(char **environment, const char *name)
 {
@@ -61,6 +64,8 @@ static char *last_occurrence(char **environment, const char *name)
  * diagnostics go to stderr, which pam_exec redirects to its log= target. */
 int main(int argc, char **argv, char **environment)
 {
+    /* One slot per forwarded variable, one for clean_path, one for the
+     * terminating NULL. */
     char *clean_environment[FORWARDED_VARIABLE_COUNT + 2];
     size_t clean_count = 0;
     size_t i;
@@ -70,7 +75,7 @@ int main(int argc, char **argv, char **environment)
         return 0;
     }
 
-    clean_environment[clean_count++] = (char *)CLEAN_PATH;
+    clean_environment[clean_count++] = clean_path;
     for (i = 0; i < FORWARDED_VARIABLE_COUNT; ++i) {
         char *entry = last_occurrence(environment, forwarded_variables[i]);
 
