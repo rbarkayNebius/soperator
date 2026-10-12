@@ -2,28 +2,92 @@ import functools
 import json
 import logging
 import os
+import stat
 import string
 import subprocess
 import sys
 import time
 import typing
+import urllib.parse
 
 SOPERATOR_NODE_METADATA_FILE = "/run/soperator/node_metadata.env"
 SOPERATOR_NODE_REAL_MEMORY_BYTES = "SOPERATOR_NODE_REAL_MEMORY_BYTES"
+
+# Open a log file for writing without ever following a path that an unprivileged user could have planted.
+# This script runs as root, while log directories are shared with Slurm jobs of arbitrary users, so:
+# - every path component is opened with O_NOFOLLOW and directories must be owned by root (or the current user);
+# - an existing file is reused only if it's a regular file (or a character device, e.g. /dev/null) owned by
+#   root (or the current user) with a single hard link, anything else owned by another user is removed;
+# - a new file is always created with O_EXCL, so a concurrently planted entry makes the open fail.
+# Returns a file descriptor.
+def open_log_file(path: str) -> int:
+    if not os.path.isabs(path):
+        raise ValueError(f"log path {path} is not absolute")
+    *dir_names, file_name = [part for part in os.path.normpath(path).split("/") if part]
+    trusted_uids = (0, os.geteuid())
+
+    dir_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for dir_name in dir_names:
+            dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                next_dir_fd = os.open(dir_name, dir_flags, dir_fd=dir_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(dir_name, mode=0o775, dir_fd=dir_fd)
+                except FileExistsError:
+                    pass
+                next_dir_fd = os.open(dir_name, dir_flags, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_dir_fd
+            dir_uid = os.fstat(dir_fd).st_uid
+            if dir_uid not in trusted_uids:
+                raise PermissionError(f"directory {dir_name} of log path {path} is owned by uid {dir_uid}")
+
+        try:
+            st = os.stat(file_name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            reusable = st.st_uid in trusted_uids and (
+                stat.S_ISCHR(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
+            )
+            if reusable:
+                fd = os.open(file_name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+                fd_st = os.fstat(fd)
+                if (fd_st.st_dev, fd_st.st_ino) != (st.st_dev, st.st_ino):
+                    os.close(fd)
+                    raise PermissionError(f"log file {path} was replaced while opening")
+                os.set_blocking(fd, True)
+                if stat.S_ISREG(fd_st.st_mode):
+                    os.ftruncate(fd, 0)
+                return fd
+            if st.st_uid in trusted_uids:
+                raise PermissionError(f"log path {path} is not a regular file with a single link")
+            os.unlink(file_name, dir_fd=dir_fd)
+
+        return os.open(
+            file_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode=0o644,
+            dir_fd=dir_fd,
+        )
+    finally:
+        os.close(dir_fd)
 
 # Set up logging
 try:
     log_stdout = "/dev/stdout"
     log_path = os.environ.get("CHECKS_RUNNER_OUTPUT", log_stdout)
+    log_target = {"filename": log_stdout, "filemode": "w"}
     if log_path != log_stdout:
-        log_dir = os.path.dirname(log_path)
-        os.makedirs(log_dir, mode=0o777, exist_ok=True)
-        if not os.path.exists(log_path):
-            open(log_path, 'w').close()
+        try:
+            log_target = {"stream": os.fdopen(open_log_file(log_path), "w")}
+        except Exception as e:
+            print(f"Failed to open log file {log_path}, logging to stdout: {e}")
     logging.Formatter.converter = time.gmtime
     logging.basicConfig(
-        filename=log_path,
-        filemode='w',
+        **log_target,
         format='[%(asctime)s.%(msecs)03d UTC] %(levelname)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         level=logging.INFO
@@ -148,7 +212,9 @@ def main():
         check_runner_var = key.startswith("CHECKS_")
         path_var = key == "PATH"
         if slurm_var or check_runner_var or path_var:
-            logging.info(f"Environment {key}=\"{value}\"")
+            # Values like SLURM_JOB_NAME are chosen by the job submitter: escape whitespace, colons and quotes
+            # so that no user-supplied token appears verbatim in this root-written file.
+            logging.info(f"Environment {key}=\"{urllib.parse.quote(value, safe='/,=+@')}\"")
 
     # Skip all checks if requested in the job comment
     if SLURM_JOB_COMMENT == "skip_checks":
@@ -285,12 +351,19 @@ def run_check(check: Check, in_jail=False):
     logging.info(f"Running check {check.name} ({check.command}), logging to {log_abs_path}")
     logging.info(f"Check spec: {json.dumps(check._asdict(), indent=2)}")
 
-    # Create parent dirs with full permissions
-    os.makedirs(os.path.dirname(log_abs_path), mode=0o777, exist_ok=True)
+    # Open the log file here instead of using a shell redirect, which would follow symlinks planted by users
+    try:
+        log_fd = open_log_file(log_abs_path)
+    except Exception as e:
+        logging.warning(f"Failed to open log file {log_abs_path} for check {check.name}, discarding its output: {e}")
+        log_fd = os.open(os.devnull, os.O_WRONLY)
 
-    # Execute the check command
-    cmd = ["bash", "-l", "-c", f"{check.command} 3>&1 1>\"{log_abs_path}\" 2>&1"]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Execute the check command: its stdout and stderr go to the log file, file descriptor 3 is captured as details
+    cmd = ["bash", "-l", "-c", f"{check.command} 3>&1 1>&2"]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=log_fd, text=True)
+    finally:
+        os.close(log_fd)
 
     # Build the reason message
     reason_base = string.Template(check.reason_base.rstrip()).safe_substitute(

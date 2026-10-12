@@ -80,10 +80,12 @@ def get_hc_result(proc: subprocess.CompletedProcess) -> HealthCheckerResult:
 def ensure_output_dir(path_str: str) -> None:
     path = pathlib.Path(path_str)
 
+    # Only root writes into this directory, so it's not writable by users (but by the root group, the log
+    # collector deletes files as a member of it); permissions of an existing directory are managed by complement_jail.sh.
+    # Never chmod by path here: a user-planted symlink would make root change permissions of its target.
     old_umask = os.umask(0)
     try:
-        path.mkdir(parents=True, exist_ok=True)
-        os.chmod(path, 0o777)
+        path.mkdir(mode=0o775, parents=True, exist_ok=True)
     finally:
         os.umask(old_umask)
 

@@ -116,6 +116,68 @@ class CheckRunnerOnOkContextTest(unittest.TestCase):
             self.assertEqual(["uncomment"], calls)
 
 
+class LogFileSymlinkTest(unittest.TestCase):
+    ATTACKER_UID = 65534
+
+    def plant_symlink(self, target: Path, link: Path):
+        link.symlink_to(target)
+        if os.geteuid() == 0:
+            os.lchown(link, self.ATTACKER_UID, self.ATTACKER_UID)
+
+    def test_check_log_does_not_follow_planted_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CheckRunnerOnOkContextTest.load_runner(self, "epilog", tmpdir)
+            target = Path(tmpdir) / "victim"
+            target.write_text("original\n", encoding="utf-8")
+            log = Path(tmpdir) / "check.out"
+            self.plant_symlink(target, log)
+            check = runner.Check(name="echo", command="echo from-check", log="check.out")
+
+            runner.run_check(check, in_jail=True)
+
+            self.assertEqual("original\n", target.read_text(encoding="utf-8"))
+            if os.geteuid() == 0:
+                self.assertFalse(log.is_symlink())
+                self.assertEqual("from-check\n", log.read_text(encoding="utf-8"))
+
+    def test_open_log_file_does_not_create_symlink_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CheckRunnerOnOkContextTest.load_runner(self, "epilog", tmpdir)
+            target = Path(tmpdir) / "ld.so.preload"
+            log = Path(tmpdir) / "worker-1.check_runner.epilog.out"
+            self.plant_symlink(target, log)
+
+            try:
+                os.close(runner.open_log_file(str(log)))
+            except PermissionError:
+                pass
+
+            self.assertFalse(target.exists())
+
+    def test_open_log_file_refuses_symlinked_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CheckRunnerOnOkContextTest.load_runner(self, "epilog", tmpdir)
+            target_dir = Path(tmpdir) / "etc"
+            target_dir.mkdir()
+            self.plant_symlink(target_dir, Path(tmpdir) / "slurm_scripts")
+
+            with self.assertRaises(OSError):
+                runner.open_log_file(str(Path(tmpdir) / "slurm_scripts" / "check.out"))
+
+            self.assertEqual([], list(target_dir.iterdir()))
+
+    def test_open_log_file_truncates_own_regular_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = CheckRunnerOnOkContextTest.load_runner(self, "epilog", tmpdir)
+            log = Path(tmpdir) / "check.out"
+            log.write_text("previous run\n", encoding="utf-8")
+
+            with os.fdopen(runner.open_log_file(str(log)), "w") as f:
+                f.write("new run\n")
+
+            self.assertEqual("new run\n", log.read_text(encoding="utf-8"))
+
+
 def load_check_runner():
     required_env = {
         "SLURMD_NODENAME": "worker-1",

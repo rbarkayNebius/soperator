@@ -415,26 +415,48 @@ pushd "${jaildir}"
     # on login nodes it is a plain shared dir.
     # shared/ stays on the shared jail FS.
     # Explicit chmod everywhere: mkdir -m does not fix permissions of existing directories, and log writers
-    # (Slurm jobs, SPANK plugins, health checks) run as arbitrary users while the log collector deletes files as a non-root user.
-    for dir in \
-        opt/soperator-outputs \
-        opt/soperator-outputs/local \
-        opt/soperator-outputs/local/nccl_logs \
-        opt/soperator-outputs/local/slurm_jobs \
-        opt/soperator-outputs/local/slurm_scripts \
-        opt/soperator-outputs/local/task_prolog \
-        opt/soperator-outputs/local/health_checker_cmd_stdout \
-        opt/soperator-outputs/shared \
-        opt/soperator-outputs/shared/nccl_profiles \
-        opt/soperator-outputs/shared/acceptance
+    # (Slurm jobs, SPANK plugins) run as arbitrary users while the log collector deletes files as a non-root user
+    # in the root group.
+    # Modes:
+    # - 1777 for parent directories: sticky, so users can't rename or replace the root-owned subdirectories;
+    # - 777 for directories written by user jobs;
+    # - 775 (root:root) for directories written by root (Prolog, Epilog, HealthCheckProgram, health-checker),
+    #   so users can't plant symlinks there that root would follow, while the log collector can still delete files.
+    # Parents are listed before their children, so a child can't be replaced once its parent has been checked.
+    for dir_mode in \
+        opt/soperator-outputs:1777 \
+        opt/soperator-outputs/local:1777 \
+        opt/soperator-outputs/local/nccl_logs:777 \
+        opt/soperator-outputs/local/slurm_jobs:777 \
+        opt/soperator-outputs/local/slurm_scripts:775 \
+        opt/soperator-outputs/local/task_prolog:777 \
+        opt/soperator-outputs/local/health_checker_cmd_stdout:775 \
+        opt/soperator-outputs/shared:1777 \
+        opt/soperator-outputs/shared/nccl_profiles:777 \
+        opt/soperator-outputs/shared/acceptance:777
     do
+        dir="${dir_mode%:*}"
+        mode="${dir_mode##*:}"
+        # Users could have replaced the directory while its parent was world-writable without the sticky bit;
+        # never chown / chmod through a symlink or a non-directory.
+        if [ -L "${dir}" ] || { [ -e "${dir}" ] && [ ! -d "${dir}" ]; }; then
+            log "[outputs] Remove unexpected non-directory ${dir}"
+            rm -f "${dir}"
+        fi
         mkdir -p "${dir}"
-        # chmod only when perms actually differ: an unconditional chmod is a setattr that bumps ctime even when
+        # chown / chmod only when they actually differ: an unconditional chmod is a setattr that bumps ctime even when
         # the mode is unchanged, and every node runs this on startup — on the shared-FS dirs that would be a metadata
         # write storm scaling with cluster size, plus needless remote churn next to dentries workers keep bind mounts on.
         # In the steady state this loop is stat-only.
-        if [ "$(stat -c '%a' "${dir}")" != "777" ]; then
-            chmod 777 "${dir}"
+        if [ "$(stat -c '%u:%g' "${dir}")" != "0:0" ]; then
+            chown -h 0:0 "${dir}"
+        fi
+        if [ -L "${dir}" ] || [ ! -d "${dir}" ]; then
+            log "[outputs] Skip setting permissions of ${dir}: it's not a directory"
+            continue
+        fi
+        if [ "$(stat -c '%a' "${dir}")" != "${mode}" ]; then
+            chmod "${mode}" "${dir}"
         fi
     done
 
