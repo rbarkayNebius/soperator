@@ -18,7 +18,7 @@ SOPERATOR_NODE_REAL_MEMORY_BYTES = "SOPERATOR_NODE_REAL_MEMORY_BYTES"
 # - every path component is opened with O_NOFOLLOW and directories must be owned by root (or the current user);
 # - an existing file is reused only if it's a regular file (or a character device, e.g. /dev/null) owned by
 #   root (or the current user) with a single hard link, anything else owned by another user is removed;
-# - a new file is always created with O_EXCL, so a concurrently planted entry makes the open fail.
+# - a new file is always created with O_EXCL, so a concurrently planted entry is never opened.
 # Returns a file descriptor.
 def open_log_file(path: str) -> int:
     if not os.path.isabs(path):
@@ -44,34 +44,43 @@ def open_log_file(path: str) -> int:
             if dir_uid not in trusted_uids:
                 raise PermissionError(f"directory {dir_name} of log path {path} is owned by uid {dir_uid}")
 
-        try:
-            st = os.stat(file_name, dir_fd=dir_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            st = None
-        if st is not None:
-            reusable = st.st_uid in trusted_uids and (
-                stat.S_ISCHR(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
-            )
-            if reusable:
-                fd = os.open(file_name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-                fd_st = os.fstat(fd)
-                if (fd_st.st_dev, fd_st.st_ino) != (st.st_dev, st.st_ino):
-                    os.close(fd)
-                    raise PermissionError(f"log file {path} was replaced while opening")
-                os.set_blocking(fd, True)
-                if stat.S_ISREG(fd_st.st_mode):
-                    os.ftruncate(fd, 0)
-                return fd
-            if st.st_uid in trusted_uids:
-                raise PermissionError(f"log path {path} is not a regular file with a single link")
-            os.unlink(file_name, dir_fd=dir_fd)
+        # Retry if the file is created concurrently, e.g. by Prologs of two jobs starting at the same time
+        for _ in range(3):
+            try:
+                st = os.stat(file_name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                st = None
+            if st is not None:
+                reusable = st.st_uid in trusted_uids and (
+                    stat.S_ISCHR(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
+                )
+                if reusable:
+                    fd = os.open(file_name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+                    fd_st = os.fstat(fd)
+                    if (fd_st.st_dev, fd_st.st_ino) != (st.st_dev, st.st_ino):
+                        os.close(fd)
+                        raise PermissionError(f"log file {path} was replaced while opening")
+                    os.set_blocking(fd, True)
+                    if stat.S_ISREG(fd_st.st_mode):
+                        os.ftruncate(fd, 0)
+                    return fd
+                if st.st_uid in trusted_uids:
+                    raise PermissionError(f"log path {path} is not a regular file with a single link")
+                try:
+                    os.unlink(file_name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
 
-        return os.open(
-            file_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            mode=0o644,
-            dir_fd=dir_fd,
-        )
+            try:
+                return os.open(
+                    file_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    mode=0o644,
+                    dir_fd=dir_fd,
+                )
+            except FileExistsError:
+                continue
+        raise FileExistsError(f"log file {path} keeps being recreated concurrently")
     finally:
         os.close(dir_fd)
 
@@ -214,7 +223,8 @@ def main():
         if slurm_var or check_runner_var or path_var:
             # Values like SLURM_JOB_NAME are chosen by the job submitter: escape whitespace, colons and quotes
             # so that no user-supplied token appears verbatim in this root-written file.
-            logging.info(f"Environment {key}=\"{urllib.parse.quote(value, safe='/,=+@')}\"")
+            quoted_value = urllib.parse.quote(value, safe="/,=+@", errors="surrogateescape")
+            logging.info(f"Environment {key}=\"{quoted_value}\"")
 
     # Skip all checks if requested in the job comment
     if SLURM_JOB_COMMENT == "skip_checks":

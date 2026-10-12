@@ -74,6 +74,38 @@ lib_has_real_content() {
     [ "$(stat -Lc %s "$1" 2>/dev/null || echo 0)" -gt 1024 ]
 }
 
+# Create Soperator output directory ${1} owned by root:root with mode ${2}.
+# Users could have replaced it while its parent was world-writable without the sticky bit,
+# so never chown / chmod / mount through a symlink or a non-directory.
+# Mode 775 marks directories written only by root: entries planted there by other users are removed.
+# Errors are not fatal: a user racing with these checks must not prevent the node from starting.
+ensure_outputs_dir() {
+    local dir="${1}" mode="${2}"
+    if [ -L "${dir}" ] || { [ -e "${dir}" ] && [ ! -d "${dir}" ]; }; then
+        log "[outputs] Remove unexpected non-directory ${dir}"
+        rm -f "${dir}" || true
+    fi
+    mkdir -p "${dir}" || true
+    # chown / chmod only when they actually differ: an unconditional chmod is a setattr that bumps ctime even when
+    # the mode is unchanged, and every node runs this on startup — on the shared-FS dirs that would be a metadata
+    # write storm scaling with cluster size, plus needless remote churn next to dentries workers keep bind mounts on.
+    # In the steady state this is stat-only.
+    if [ "$(stat -c '%u:%g' "${dir}" 2>/dev/null)" != "0:0" ]; then
+        chown -h 0:0 "${dir}" || true
+    fi
+    # Once root-owned, the directory can't be replaced by users because its parent is sticky or root-only.
+    if [ -L "${dir}" ] || [ ! -d "${dir}" ] || [ "$(stat -c '%u' "${dir}" 2>/dev/null)" != "0" ]; then
+        log "[outputs] Skip setting permissions of ${dir}: it's not a root-owned directory"
+        return 0
+    fi
+    if [ "$(stat -c '%a' "${dir}")" != "${mode}" ]; then
+        chmod "${mode}" "${dir}"
+    fi
+    if [ "${mode}" = "775" ]; then
+        find "${dir}" -mindepth 1 -maxdepth 1 ! -uid 0 -exec rm -rf --one-file-system {} + || true
+    fi
+}
+
 # Make sure the NVIDIA soname symlink exists AND points at real content after the ldconfig phase:
 # repair by running ldconfig here if not, and restart the container when the jail still has no
 # working NVML. ${1} says what happened on this worker:
@@ -305,6 +337,10 @@ pushd "${jaildir}"
       mount --bind /var/lib/sss/pipes var/lib/sss/pipes
     fi
 
+    log "[outputs] Sanitize Soperator output directories before mounting node-local outputs over them"
+    ensure_outputs_dir opt/soperator-outputs 1777
+    ensure_outputs_dir opt/soperator-outputs/local 1777
+
     log "[submounts] Bind-mount jail submounts from upper ${upperdir} into the actual ${jaildir}"
     submounts=$( \
         findmnt --output TARGET --submounts --target / --pairs | \
@@ -423,6 +459,7 @@ pushd "${jaildir}"
     # - 775 (root:root) for directories written by root (Prolog, Epilog, HealthCheckProgram, health-checker),
     #   so users can't plant symlinks there that root would follow, while the log collector can still delete files.
     # Parents are listed before their children, so a child can't be replaced once its parent has been checked.
+    # opt/soperator-outputs/local is checked again: on workers it's now the node-local bind mount.
     for dir_mode in \
         opt/soperator-outputs:1777 \
         opt/soperator-outputs/local:1777 \
@@ -435,29 +472,7 @@ pushd "${jaildir}"
         opt/soperator-outputs/shared/nccl_profiles:777 \
         opt/soperator-outputs/shared/acceptance:777
     do
-        dir="${dir_mode%:*}"
-        mode="${dir_mode##*:}"
-        # Users could have replaced the directory while its parent was world-writable without the sticky bit;
-        # never chown / chmod through a symlink or a non-directory.
-        if [ -L "${dir}" ] || { [ -e "${dir}" ] && [ ! -d "${dir}" ]; }; then
-            log "[outputs] Remove unexpected non-directory ${dir}"
-            rm -f "${dir}"
-        fi
-        mkdir -p "${dir}"
-        # chown / chmod only when they actually differ: an unconditional chmod is a setattr that bumps ctime even when
-        # the mode is unchanged, and every node runs this on startup — on the shared-FS dirs that would be a metadata
-        # write storm scaling with cluster size, plus needless remote churn next to dentries workers keep bind mounts on.
-        # In the steady state this loop is stat-only.
-        if [ "$(stat -c '%u:%g' "${dir}")" != "0:0" ]; then
-            chown -h 0:0 "${dir}"
-        fi
-        if [ -L "${dir}" ] || [ ! -d "${dir}" ]; then
-            log "[outputs] Skip setting permissions of ${dir}: it's not a directory"
-            continue
-        fi
-        if [ "$(stat -c '%a' "${dir}")" != "${mode}" ]; then
-            chmod "${mode}" "${dir}"
-        fi
+        ensure_outputs_dir "${dir_mode%:*}" "${dir_mode##*:}"
     done
 
     # For login nodes in GPU clusters and CPU workers in GPU clusters
